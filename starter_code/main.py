@@ -1,11 +1,14 @@
 # Start from the last coding stage of the previous LLM evals project
 import json
+import logging
 import os
+from functools import lru_cache
+from urllib.parse import urlparse
 
 import dotenv
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, AIMessage, trim_messages
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -22,11 +25,44 @@ from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
 from nemoguardrails.rails.llm.options import GenerationOptions
 
 app = FastAPI(title="Smartphone Assistant API")
+logger = logging.getLogger(__name__)
 
 class QueryRequest(BaseModel):
     user_input: str
     user_id: str
     session_id: str
+
+    @field_validator("user_input", "user_id", "session_id")
+    @classmethod
+    def validate_non_empty_value(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+
+class AppConfig(BaseModel):
+    openai_model: str
+    openai_embeddings_model: str
+    litellm_api_key: str
+    openai_base_url: str
+    redis_url: str
+
+    @field_validator("openai_model", "openai_embeddings_model", "litellm_api_key")
+    @classmethod
+    def validate_required_setting(cls, value: str) -> str:
+        if not value or value == "<>":
+            raise ValueError("must be configured")
+        return value
+
+    @field_validator("openai_base_url", "redis_url")
+    @classmethod
+    def validate_url(cls, value: str) -> str:
+        parsed_url = urlparse(value)
+        if not parsed_url.scheme or not parsed_url.netloc:
+            raise ValueError("must be a valid URL")
+        return value
+
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -39,27 +75,33 @@ litellm_base_url = os.getenv(
     "OPENAI_BASE_URL",
     "https://litellm.aks-hs-prod.int.hyperskill.org/openai",
 )
+config = AppConfig(
+    openai_model=os.getenv("OPENAI_MODEL", ""),
+    openai_embeddings_model=os.getenv("OPENAI_EMBEDDINGS_MODEL", ""),
+    litellm_api_key=litellm_api_key or "",
+    openai_base_url=litellm_base_url,
+    redis_url=os.getenv("REDIS_URL", "redis://localhost:6380/0"),
+)
 if litellm_api_key:
     os.environ["OPENAI_API_KEY"] = litellm_api_key
 
 # Initialize the LLM with OpenAI API credentials (substitute for other models)
 llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL"),
-    base_url=litellm_base_url,
-    api_key=litellm_api_key,
+    model=config.openai_model,
+    base_url=config.openai_base_url,
+    api_key=config.litellm_api_key,
 )
 
 # Initialize the embeddings model with OpenAI API credentials
 embeddings_model = OpenAIEmbeddings(
-    model=os.getenv("OPENAI_EMBEDDINGS_MODEL"),
-    base_url=litellm_base_url,
-    api_key=litellm_api_key,
+    model=config.openai_embeddings_model,
+    base_url=config.openai_base_url,
+    api_key=config.litellm_api_key,
     show_progress_bar=True
 )
 
 # Redis configuration
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6380/0")
-print(f"Effective Redis URL: {REDIS_URL!r}")
+REDIS_URL = config.redis_url
 
 # Initialize Langfuse client
 langfuse = get_client()
@@ -70,6 +112,7 @@ langfuse = get_client()
 # ---------------------------
 
 @observe(name="embed_documents")
+@lru_cache(maxsize=1)
 def embed_documents(json_path: str) -> QdrantVectorStore | list:
     """
     Load JSON data from the smartphones.json file and convert each entry to a Document.
@@ -84,13 +127,13 @@ def embed_documents(json_path: str) -> QdrantVectorStore | list:
         with open(json_path, "r") as f:
             data = json.load(f)
     except FileNotFoundError:
-        print(f"Error: The file {json_path} was not found.")
+        logger.exception("Smartphone data file was not found: %s", json_path)
         return []
-    except json.JSONDecodeError as jde:
-        print(f"Error decoding JSON from file {json_path}: {jde}")
+    except json.JSONDecodeError:
+        logger.exception("Could not decode smartphone data file: %s", json_path)
         return []
-    except Exception as e:
-        print(f"An unexpected error occurred while reading {json_path}: {e}")
+    except Exception:
+        logger.exception("Unexpected error while reading smartphone data file: %s", json_path)
         return []
 
     documents = []
@@ -146,8 +189,8 @@ def embed_documents(json_path: str) -> QdrantVectorStore | list:
 
             return qdrant_store
 
-    except Exception as e:
-        print(f"Error initializing the vector store: {e}")
+    except Exception:
+        logger.exception("Could not initialize the smartphone vector store")
         return []
 
 # ---------------------------
@@ -170,11 +213,9 @@ def smartphone_info_tool(model: str) -> str:
 
         return results[0].page_content
 
-    except Exception as e:
-        return (
-            f"Error during smartphone information retrieval "
-            f"for model {model}: {e}"
-        )
+    except Exception:
+        logger.exception("Smartphone information retrieval failed for model %s", model)
+        return "The smartphone product database is currently unavailable."
 
 
 # ---------------------------
@@ -214,11 +255,11 @@ def generate_context(ai_message: AIMessage, conversation: list, config: dict | N
                 tool_output = smartphone_info_tool.invoke(tool_call, config=config)
                 conversation.append(tool_output)
 
-    except Exception as e:
-        print(f"An error occurred while processing tool calls: {e}")
+    except Exception:
+        logger.exception("An error occurred while processing tool calls")
         conversation.append(
             AIMessage(
-                content=f"An error occurred while processing tool calls: {e}"
+                content="An error occurred while processing tool calls."
             )
         )
 
@@ -359,9 +400,10 @@ def ask(request: QueryRequest) -> dict[str, str]:
         return {"response": response.content}
 
     except Exception as e:
+        logger.exception("Failed to generate a response")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to generate a response: {e}",
+            detail="Failed to generate a response.",
         ) from e
 
 
