@@ -1,49 +1,52 @@
-# Python cache files
-__pycache__/
-*.py[cod]
+# Version control and repository metadata
+.git
+.gitignore
+.gitattributes
 
-# Virtual environment directories
-venv/
+# Runtime secrets and local environment configuration
 .env
+.env.*
+**/.env
+**/.env.*
+*.pem
+*.key
+secrets/
+**/secrets/
 
-# Local configuration files
-*.env
-
-# IDE and editor directories
-.idea/
-.vscode/
-
-# Build directories
-build/
-dist/
-
-
-# Logs
+# Python caches, virtual environments, and build artifacts
+**/__pycache__/
+**/*.py[cod]
+**/.venv/
+**/venv/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
+**/htmlcov/
+**/build/
+**/dist/
+**/*.egg-info/
+**/.ipynb_checkpoints/
+**/docs/_build/
 *.log
-
-# Coverage reports
-*.coverage
-
-# Jupyter Notebook checkpoints
-.ipynb_checkpoints/
-
-# Miscellaneous
-*.swp
-
-# System files
-.DS_Store
-
-# Python bytecode files
-*.pyc
-
-# C extensions
 *.so
-
-# Backup files
+*.swp
+*.tmp
 *~
 
-# Temporary files
-*.tmp
+# Tests, editor settings, documentation, and task assets
+**/tests/
+.idea/
+.vscode/
+.agents/
+.codex/
+images/
+tasks/
+*.md
+!starter_code/README.md
 
-# Documentation build directories
-docs/_build/
+# Local operating-system and container artifacts
+.DS_Store
+Dockerfile*
+docker-compose*.yml
+docker-compose*.yaml
