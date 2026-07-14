@@ -3,7 +3,6 @@ import json
 import logging
 import os
 from functools import lru_cache
-from urllib.parse import urlparse
 
 import dotenv
 import uvicorn
@@ -15,14 +14,18 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
-from langchain_redis import RedisChatMessageHistory
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams
-from langfuse import observe, propagate_attributes, get_client
+from langfuse import observe, propagate_attributes
 from langfuse.langchain import CallbackHandler
 from nemoguardrails import RailsConfig
 from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
 from nemoguardrails.rails.llm.options import GenerationOptions
+
+from cloud_config import load_app_config
+from cloud_services import (
+    create_redis_chat_history,
+    initialize_langfuse_client,
+    initialize_qdrant_store,
+)
 
 app = FastAPI(title="Smartphone Assistant API")
 logger = logging.getLogger(__name__)
@@ -41,49 +44,14 @@ class QueryRequest(BaseModel):
         return value
 
 
-class AppConfig(BaseModel):
-    openai_model: str
-    openai_embeddings_model: str
-    litellm_api_key: str
-    openai_base_url: str
-    redis_url: str
-
-    @field_validator("openai_model", "openai_embeddings_model", "litellm_api_key")
-    @classmethod
-    def validate_required_setting(cls, value: str) -> str:
-        if not value or value == "<>":
-            raise ValueError("must be configured")
-        return value
-
-    @field_validator("openai_base_url", "redis_url")
-    @classmethod
-    def validate_url(cls, value: str) -> str:
-        parsed_url = urlparse(value)
-        if not parsed_url.scheme or not parsed_url.netloc:
-            raise ValueError("must be a valid URL")
-        return value
-
-
 # Load environment variables from .env file
 dotenv.load_dotenv()
 
 # Use the per-user LiteLLM proxy key when available. NeMo Guardrails reads the
 # standard OpenAI environment variable internally, so expose the same proxy key
 # there as well.
-litellm_api_key = os.getenv("LITELLM_API_KEY") or os.getenv("OPENAI_API_KEY")
-litellm_base_url = os.getenv(
-    "OPENAI_BASE_URL",
-    "https://litellm.aks-hs-prod.int.hyperskill.org/openai",
-)
-config = AppConfig(
-    openai_model=os.getenv("OPENAI_MODEL", ""),
-    openai_embeddings_model=os.getenv("OPENAI_EMBEDDINGS_MODEL", ""),
-    litellm_api_key=litellm_api_key or "",
-    openai_base_url=litellm_base_url,
-    redis_url=os.getenv("REDIS_URL", "redis://localhost:6380/0"),
-)
-if litellm_api_key:
-    os.environ["OPENAI_API_KEY"] = litellm_api_key
+config = load_app_config()
+os.environ["OPENAI_API_KEY"] = config.litellm_api_key
 
 # Initialize the LLM with OpenAI API credentials (substitute for other models)
 llm = ChatOpenAI(
@@ -103,8 +71,12 @@ embeddings_model = OpenAIEmbeddings(
 # Redis configuration
 REDIS_URL = config.redis_url
 
-# Initialize Langfuse client
-langfuse = get_client()
+# Initialize the Langfuse Cloud client with the configured project.
+langfuse = initialize_langfuse_client(
+    public_key=config.langfuse_public_key,
+    secret_key=config.langfuse_secret_key,
+    host=config.langfuse_host,
+)
 
 
 # ---------------------------
@@ -156,38 +128,12 @@ def embed_documents(json_path: str) -> QdrantVectorStore | list:
         documents.append(Document(page_content=content))
 
     try:
-        collection_name = "smartphones"
-        qdrant_client = QdrantClient("http://localhost:6333")
-
-        collection_exists = qdrant_client.collection_exists(collection_name=collection_name)
-        if not collection_exists:
-            qdrant_client.create_collection(
-                collection_name=collection_name,
-                vectors_config=VectorParams(
-                    size=1536,
-                    distance=Distance.COSINE,
-                ),
-            )
-
-            qdrant_store = QdrantVectorStore(
-                client=qdrant_client,
-                collection_name=collection_name,
-                embedding=embeddings_model,
-            )
-
-            qdrant_store.add_documents(documents=documents)
-
-            return qdrant_store
-
-        # no need to create a vector store every time
-        else:
-            qdrant_store = QdrantVectorStore.from_existing_collection(
-                embedding=embeddings_model,
-                collection_name=collection_name,
-                url="http://localhost:6333",
-            )
-
-            return qdrant_store
+        return initialize_qdrant_store(
+            documents=documents,
+            embeddings_model=embeddings_model,
+            qdrant_url=config.qdrant_url,
+            qdrant_api_key=config.qdrant_api_key,
+        )
 
     except Exception:
         logger.exception("Could not initialize the smartphone vector store")
@@ -307,7 +253,7 @@ langfuse_handler = CallbackHandler()
 @app.post("/ask")
 def ask(request: QueryRequest) -> dict[str, str]:
     try:
-        redis_history = RedisChatMessageHistory(
+        redis_history = create_redis_chat_history(
             session_id=request.session_id,
             redis_url=REDIS_URL,
             ttl=3600,
