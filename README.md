@@ -48,33 +48,54 @@ This project uses [uv](https://docs.astral.sh/uv/) for Python package management
 1. Clone the repository:
    ```bash
    git clone <repository-url>
-   cd AI-Engineer-Deploy/starter_code
+   cd AI-Engineer-Deploy
    ```
 
-2. Install dependencies using `uv`:
+2. From the repository root, install the locked dependencies using `uv`:
    ```bash
-   uv sync
+   uv sync --directory starter_code --locked
    ```
 
    This will:
-   - Create a virtual environment in `.venv/`
-   - Install all dependencies from `pyproject.toml`
-   - Generate/update the `uv.lock` file for reproducible builds
+   - Create or reuse uv's managed project environment in `starter_code/.venv/`
+   - Install the exact dependencies from `starter_code/uv.lock`
+   - Fail instead of changing the lockfile if `pyproject.toml` and `uv.lock` disagree
 
 3. Set up environment variables:
    ```bash
-   cp .env.sample .env
-   # Edit .env with your API keys and configuration
+   cp starter_code/.env.sample starter_code/.env
+   # Edit starter_code/.env with your API keys and configuration
    ```
+
+### Running the Tests
+
+Run the complete test suite from the repository root:
+
+```bash
+uv run --directory starter_code --locked python -m unittest discover -s tests -v
+```
+
+The `--directory starter_code` option is required because the Python project
+metadata and flat application modules live under `starter_code/`. It makes both
+uv project selection and the subprocess working directory explicit, so test
+discovery can import those modules without manual environment activation.
+
+Validated from a fresh shell with no activated Conda or virtual environment,
+using uv's managed project environment.
+
+As a future cleanup, an installable package or conventional `src/` layout could
+simplify imports and root-level test execution. That refactor is intentionally
+out of scope for this assignment and PR.
 
 ### Running the Application
 
 ```bash
-uv run python main.py
+uv run --directory starter_code python main.py
 ```
 
 If your IDE (VS Code, PyCharm) isn't recognizing the environment or you need to use tools that aren't uv-aware, activate the virtual environment manually:
 ```bash
+cd starter_code
 source .venv/bin/activate  # On macOS/Linux
 # or
 .venv\Scripts\activate  # On Windows
@@ -88,13 +109,13 @@ python main.py
 To add new packages to the project:
 
 ```bash
-uv add <package-name>
+uv add --directory starter_code <package-name>
 ```
 
 For development dependencies:
 
 ```bash
-uv add --dev <package-name>
+uv add --directory starter_code --dev <package-name>
 ```
 
 ### Managing Environment Variables
