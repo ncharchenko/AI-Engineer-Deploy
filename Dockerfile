@@ -29,12 +29,13 @@ ENV PATH=/app/.venv/bin:$PATH \
     PYTHONUNBUFFERED=1
 
 RUN groupadd --system app && \
-    useradd --system --gid app --home-dir /app --no-create-home app
+    useradd --system --gid app --home-dir /app --no-create-home app && \
+    install -d --owner=app --group=app --mode=0755 /app/.gunicorn
 
 WORKDIR /app
 
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
-COPY --from=builder --chown=app:app /app/main.py /app/cloud_config.py /app/cloud_services.py ./
+COPY --from=builder --chown=app:app /app/main.py /app/health.py /app/cloud_config.py /app/cloud_services.py ./
 COPY --from=builder --chown=app:app /app/config ./config
 COPY --from=builder --chown=app:app /app/datasets ./datasets
 

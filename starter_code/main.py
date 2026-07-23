@@ -3,9 +3,12 @@ import json
 import logging
 import os
 from functools import lru_cache
+from typing import Any
 
+import boto3
 import dotenv
 import uvicorn
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, field_validator
 from langchain_core.documents import Document
@@ -26,9 +29,88 @@ from cloud_services import (
     initialize_langfuse_client,
     initialize_qdrant_store,
 )
+from health import router as health_router
 
 app = FastAPI(title="Smartphone Assistant API")
+app.include_router(health_router)
 logger = logging.getLogger(__name__)
+
+def load_secrets_from_aws() -> None:
+    """Load application configuration from AWS Secrets Manager.
+
+    AWS Secrets Manager is enabled when APP_SECRET_ID is set. Local development
+    can continue using environment variables or a .env file when it is absent.
+    """
+    secret_id = os.getenv("APP_SECRET_ID")
+    if not secret_id:
+        logger.info(
+            "APP_SECRET_ID is not set; using local environment configuration"
+        )
+        return
+
+    region_name = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
+    if not region_name:
+        raise RuntimeError(
+            "AWS_REGION or AWS_DEFAULT_REGION must be set when "
+            "APP_SECRET_ID is configured"
+        )
+
+    client = boto3.client(
+        "secretsmanager",
+        region_name=region_name,
+    )
+
+    try:
+        response: dict[str, Any] = client.get_secret_value(
+            SecretId=secret_id
+        )
+    except (BotoCoreError, ClientError) as exc:
+        raise RuntimeError(
+            "Unable to load application configuration from "
+            f"AWS Secrets Manager secret {secret_id!r}"
+        ) from exc
+
+    secret_string = response.get("SecretString")
+    if not secret_string:
+        raise RuntimeError(
+            f"AWS Secrets Manager secret {secret_id!r} must contain "
+            "a JSON SecretString"
+        )
+
+    try:
+        secret_values = json.loads(secret_string)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"AWS Secrets Manager secret {secret_id!r} "
+            "does not contain valid JSON"
+        ) from exc
+
+    if not isinstance(secret_values, dict):
+        raise RuntimeError(
+            f"AWS Secrets Manager secret {secret_id!r} "
+            "must contain a JSON object"
+        )
+
+    for key, value in secret_values.items():
+        if not isinstance(key, str) or not key:
+            raise RuntimeError(
+                f"AWS Secrets Manager secret {secret_id!r} "
+                "contains an invalid key"
+            )
+
+        if value is None:
+            raise RuntimeError(
+                f"AWS Secrets Manager secret {secret_id!r} "
+                f"contains null for {key!r}"
+            )
+
+        os.environ[key] = str(value)
+
+    logger.info(
+        "Loaded %d configuration values from AWS Secrets Manager secret %s",
+        len(secret_values),
+        secret_id,
+    )
 
 class QueryRequest(BaseModel):
     user_input: str
@@ -44,8 +126,10 @@ class QueryRequest(BaseModel):
         return value
 
 
-# Load environment variables from .env file
+# Load local configuration first. When APP_SECRET_ID is configured, values
+# retrieved from AWS Secrets Manager override matching local environment values.
 dotenv.load_dotenv()
+load_secrets_from_aws()
 
 # Use the per-user LiteLLM proxy key when available. NeMo Guardrails reads the
 # standard OpenAI environment variable internally, so expose the same proxy key

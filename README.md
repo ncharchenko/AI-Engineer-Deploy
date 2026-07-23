@@ -112,6 +112,51 @@ When adding new environment variables to your project:
 
 3. **Add descriptive comments** in `.env.sample` to explain what each variable is used for, especially if it's not immediately obvious.
 
+### Cloud Service Configuration
+
+Task Two requires managed Qdrant, Redis, and Langfuse services. Provide these
+settings through the application's runtime environment or secret manager:
+
+```text
+QDRANT_URL=https://<cluster-endpoint>
+QDRANT_API_KEY=<qdrant-api-key>
+REDIS_URL=redis://<username>:<url-encoded-password>@<public-endpoint>:<port>/0
+LANGFUSE_HOST=https://cloud.langfuse.com
+LANGFUSE_PUBLIC_KEY=<langfuse-public-key>
+LANGFUSE_SECRET_KEY=<langfuse-secret-key>
+```
+
+Use `redis://` for a TLS-enabled Redis database. The Redis URL must select
+database `0`. On its first use, the smartphone information tool creates the
+`smartphones` Qdrant collection and uploads the bundled dataset; later requests
+reuse that collection. `LANGFUSE_HOST` is required explicitly. The Langfuse
+project must contain the `context_system_prompt` and `review_system_prompt`
+prompts loaded during application startup.
+
+### Production Container
+
+Build the production image from the repository root. The build does not copy
+`.env` files or accept secrets as build arguments:
+
+```bash
+docker build -t hypersite:latest .
+```
+
+Supply every required setting at runtime. No configuration value has an
+application fallback, so the container exits during startup when a required
+variable is missing or invalid:
+
+```bash
+docker run --rm --env-file starter_code/.env -p 8000:8000 hypersite:latest
+```
+
+The container continues to run as the dedicated non-root `app` user. Use
+`GET /health` as its liveness probe; it returns `{"status": "ok"}` without
+checking Redis, Qdrant, model providers, tracing, or other external services.
+
+For production, inject these variables from the platform's secret manager
+instead of storing an environment file on the host.
+
 ### Documenting Code Structure Changes
 
 If you modify the default application structure or change how the application runs:
@@ -150,7 +195,14 @@ Here are the main directories and files in this repo:
 │   │   └── prompts.yml
 │   ├── datasets
 │   │   └── smartphones.json
+│   ├── tests
+│   │   ├── test_cloud_config.py
+│   │   ├── test_cloud_services.py
+│   │   └── test_health.py
 │   ├── .env.sample
+│   ├── cloud_config.py
+│   ├── cloud_services.py
+│   ├── health.py
 │   ├── main.py
 │   ├── pyproject.toml
 │   └── uv.lock
