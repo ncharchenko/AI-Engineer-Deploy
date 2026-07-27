@@ -1,18 +1,31 @@
 import unittest
+from types import SimpleNamespace
 
 from cloud_services import (
+    PRODUCT_DATABASE_UNAVAILABLE_MESSAGE,
+    ProductDatabaseUnavailableError,
     create_redis_chat_history,
     initialize_langfuse_client,
     initialize_qdrant_store,
+    search_qdrant_store,
 )
 
 
 class FakeQdrantClient:
-    def __init__(self, *, url: str, api_key: str, collection_exists: bool) -> None:
+    def __init__(
+        self,
+        *,
+        url: str,
+        api_key: str,
+        collection_exists: bool,
+        point_count: int,
+    ) -> None:
         self.url = url
         self.api_key = api_key
         self._collection_exists = collection_exists
+        self.point_count = point_count
         self.created_collection = None
+        self.deleted_collection = None
 
     def collection_exists(self, *, collection_name: str) -> bool:
         self.checked_collection = collection_name
@@ -20,6 +33,16 @@ class FakeQdrantClient:
 
     def create_collection(self, *, collection_name: str, vectors_config: object) -> None:
         self.created_collection = (collection_name, vectors_config)
+        self._collection_exists = True
+
+    def count(self, *, collection_name: str, exact: bool) -> SimpleNamespace:
+        self.counted_collection = (collection_name, exact)
+        return SimpleNamespace(count=self.point_count)
+
+    def delete_collection(self, *, collection_name: str) -> None:
+        self.deleted_collection = collection_name
+        self._collection_exists = False
+        self.point_count = 0
 
 
 class FakeVectorStore:
@@ -42,6 +65,15 @@ class FakeVectorStore:
 
     def add_documents(self, *, documents: list[object]) -> None:
         self.added_documents = documents
+        if isinstance(self.client, FakeQdrantClient):
+            self.client.point_count = len(documents)
+
+
+class FailingPopulationStore(FakeVectorStore):
+    def add_documents(self, *, documents: list[object]) -> None:
+        raise RuntimeError(
+            "provider failed with api_key=SENSITIVE_TOKEN"
+        )
 
 
 class CapturingClient:
@@ -49,16 +81,31 @@ class CapturingClient:
         self.arguments = kwargs
 
 
+class FailingQdrantClient:
+    def __init__(self, *, url: str, api_key: str) -> None:
+        pass
+
+    def collection_exists(self, *, collection_name: str) -> bool:
+        raise ConnectionError("Qdrant is unreachable")
+
+
+class FailingVectorStore:
+    def similarity_search(self, query: str, *, k: int) -> list[object]:
+        raise TimeoutError("Qdrant search timed out")
+
+
 class QdrantCloudTests(unittest.TestCase):
     def setUp(self) -> None:
         FakeVectorStore.existing_collection_arguments = None
         self.client = None
+        self.point_count = 1
 
     def client_factory(self, *, url: str, api_key: str) -> FakeQdrantClient:
         self.client = FakeQdrantClient(
             url=url,
             api_key=api_key,
             collection_exists=self.collection_exists,
+            point_count=self.point_count,
         )
         return self.client
 
@@ -67,7 +114,7 @@ class QdrantCloudTests(unittest.TestCase):
         embedding = object()
 
         initialize_qdrant_store(
-            documents=[],
+            documents=[object()],
             embeddings_model=embedding,
             qdrant_url="https://qdrant.example.com",
             qdrant_api_key="test-key",
@@ -87,6 +134,7 @@ class QdrantCloudTests(unittest.TestCase):
 
     def test_creates_and_populates_missing_cloud_collection(self) -> None:
         self.collection_exists = False
+        self.point_count = 0
         documents = [object()]
 
         store = initialize_qdrant_store(
@@ -102,6 +150,79 @@ class QdrantCloudTests(unittest.TestCase):
         self.assertEqual(self.client.api_key, "test-key")
         self.assertEqual(self.client.created_collection[0], "smartphones")
         self.assertEqual(store.added_documents, documents)
+        self.assertEqual(
+            self.client.counted_collection,
+            ("smartphones", True),
+        )
+
+    def test_rejects_incomplete_existing_collection(self) -> None:
+        self.collection_exists = True
+        self.point_count = 0
+
+        with self.assertRaises(ProductDatabaseUnavailableError) as raised:
+            initialize_qdrant_store(
+                documents=[object()],
+                embeddings_model=object(),
+                qdrant_url="https://qdrant.example.com",
+                qdrant_api_key="test-key",
+                client_factory=self.client_factory,
+                vector_store_class=FakeVectorStore,
+            )
+
+        self.assertEqual(raised.exception.operation, "verify_collection")
+        self.assertEqual(
+            raised.exception.error_type,
+            "_IncompleteCollectionError",
+        )
+        self.assertIsNone(FakeVectorStore.existing_collection_arguments)
+
+    def test_removes_new_collection_when_population_fails(self) -> None:
+        self.collection_exists = False
+        self.point_count = 0
+
+        with self.assertRaises(ProductDatabaseUnavailableError) as raised:
+            initialize_qdrant_store(
+                documents=[object()],
+                embeddings_model=object(),
+                qdrant_url="https://qdrant.example.com",
+                qdrant_api_key="test-key",
+                client_factory=self.client_factory,
+                vector_store_class=FailingPopulationStore,
+            )
+
+        self.assertEqual(raised.exception.operation, "populate_collection")
+        self.assertEqual(raised.exception.error_type, "RuntimeError")
+        self.assertEqual(self.client.deleted_collection, "smartphones")
+        self.assertFalse(self.client._collection_exists)
+        self.assertIsNone(raised.exception.__cause__)
+
+    def test_reports_unavailable_when_qdrant_initialization_fails(self) -> None:
+        with self.assertRaisesRegex(
+            ProductDatabaseUnavailableError,
+            PRODUCT_DATABASE_UNAVAILABLE_MESSAGE,
+        ):
+            initialize_qdrant_store(
+                documents=[object()],
+                embeddings_model=object(),
+                qdrant_url="https://qdrant.example.com",
+                qdrant_api_key="test-key",
+                client_factory=FailingQdrantClient,
+                vector_store_class=FakeVectorStore,
+            )
+
+    def test_reports_unavailable_when_qdrant_search_fails(self) -> None:
+        with self.assertRaisesRegex(
+            ProductDatabaseUnavailableError,
+            PRODUCT_DATABASE_UNAVAILABLE_MESSAGE,
+        ) as raised:
+            search_qdrant_store(
+                vector_store=FailingVectorStore(),
+                query="iPhone",
+            )
+
+        self.assertEqual(raised.exception.operation, "similarity_search")
+        self.assertEqual(raised.exception.error_type, "TimeoutError")
+        self.assertIsNone(raised.exception.__cause__)
 
 
 class CloudClientWiringTests(unittest.TestCase):

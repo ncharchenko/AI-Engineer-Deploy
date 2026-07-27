@@ -73,6 +73,39 @@ class CloudConfigTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             load_app_config(environment)
 
+    def test_strips_surrounding_whitespace_from_required_values(self) -> None:
+        environment = VALID_ENVIRONMENT | {
+            "QDRANT_URL": "  https://qdrant.example.com  ",
+            "QDRANT_API_KEY": "  test-qdrant-key  ",
+        }
+
+        config = load_app_config(environment)
+
+        self.assertEqual(config.qdrant_url, "https://qdrant.example.com")
+        self.assertEqual(config.qdrant_api_key, "test-qdrant-key")
+
+    def test_rejects_whitespace_only_required_value(self) -> None:
+        environment = VALID_ENVIRONMENT | {"QDRANT_API_KEY": "   "}
+
+        with self.assertRaises(ValidationError):
+            load_app_config(environment)
+
+    def test_rejects_control_character_in_credential(self) -> None:
+        environment = VALID_ENVIRONMENT | {
+            "QDRANT_API_KEY": "test-key\ninjected-value"
+        }
+
+        with self.assertRaises(ValidationError):
+            load_app_config(environment)
+
+    def test_rejects_control_character_in_url(self) -> None:
+        environment = VALID_ENVIRONMENT | {
+            "QDRANT_URL": "https://qdrant.example.com\tunexpected"
+        }
+
+        with self.assertRaises(ValidationError):
+            load_app_config(environment)
+
 
 if __name__ == "__main__":
     unittest.main()

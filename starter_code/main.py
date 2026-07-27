@@ -1,4 +1,5 @@
 # Start from the last coding stage of the previous LLM evals project
+import hashlib
 import json
 import logging
 import os
@@ -25,15 +26,24 @@ from nemoguardrails.rails.llm.options import GenerationOptions
 
 from cloud_config import load_app_config
 from cloud_services import (
+    PRODUCT_DATABASE_UNAVAILABLE_MESSAGE,
+    ProductDatabaseUnavailableError,
     create_redis_chat_history,
     initialize_langfuse_client,
     initialize_qdrant_store,
+    search_qdrant_store,
 )
 from health import router as health_router
 
 app = FastAPI(title="Smartphone Assistant API")
 app.include_router(health_router)
 logger = logging.getLogger(__name__)
+
+
+def _session_identifier_hash(session_id: str) -> str:
+    """Return a stable, non-reversible identifier suitable for logs."""
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
+
 
 def load_secrets_from_aws() -> None:
     """Load application configuration from AWS Secrets Manager.
@@ -169,28 +179,27 @@ langfuse = initialize_langfuse_client(
 
 @observe(name="embed_documents")
 @lru_cache(maxsize=1)
-def embed_documents(json_path: str) -> QdrantVectorStore | list:
+def embed_documents(json_path: str) -> QdrantVectorStore:
     """
     Load JSON data from the smartphones.json file and convert each entry to a Document.
     :param
         json_path (str): Path to the JSON file containing smartphone data.
 
     :returns
-        QdrantVectorStore | list: A Qdrant vector store built from the smartphone documents,
-            or an empty list if an error occurs.
+        QdrantVectorStore: A Qdrant vector store built from the smartphone documents.
+
+    :raises:
+        ProductDatabaseUnavailableError: If the dataset cannot be loaded or the
+            vector store cannot be initialized.
     """
     try:
         with open(json_path, "r") as f:
             data = json.load(f)
-    except FileNotFoundError:
-        logger.exception("Smartphone data file was not found: %s", json_path)
-        return []
-    except json.JSONDecodeError:
-        logger.exception("Could not decode smartphone data file: %s", json_path)
-        return []
-    except Exception:
-        logger.exception("Unexpected error while reading smartphone data file: %s", json_path)
-        return []
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ProductDatabaseUnavailableError(
+            operation="load_dataset",
+            error_type=type(exc).__name__,
+        ) from None
 
     documents = []
     for entry in data:
@@ -211,17 +220,12 @@ def embed_documents(json_path: str) -> QdrantVectorStore | list:
         )
         documents.append(Document(page_content=content))
 
-    try:
-        return initialize_qdrant_store(
-            documents=documents,
-            embeddings_model=embeddings_model,
-            qdrant_url=config.qdrant_url,
-            qdrant_api_key=config.qdrant_api_key,
-        )
-
-    except Exception:
-        logger.exception("Could not initialize the smartphone vector store")
-        return []
+    return initialize_qdrant_store(
+        documents=documents,
+        embeddings_model=embeddings_model,
+        qdrant_url=config.qdrant_url,
+        qdrant_api_key=config.qdrant_api_key,
+    )
 
 # ---------------------------
 # Tool Definitions
@@ -231,21 +235,17 @@ def smartphone_info_tool(model: str) -> str:
     """
     Retrieves information about a smartphone model from the product database.
     """
-    try:
-        product_db = embed_documents("datasets/smartphones.json")
-        if not isinstance(product_db, QdrantVectorStore):
-            return "The smartphone product database is currently unavailable."
+    product_db = embed_documents("datasets/smartphones.json")
+    results = search_qdrant_store(
+        vector_store=product_db,
+        query=model,
+        k=1,
+    )
 
-        results = product_db.similarity_search(model, k=1)
+    if not results:
+        return "Could not find information for the specified model."
 
-        if not results:
-            return "Could not find information for the specified model."
-
-        return results[0].page_content
-
-    except Exception:
-        logger.exception("Smartphone information retrieval failed for model %s", model)
-        return "The smartphone product database is currently unavailable."
+    return results[0].page_content
 
 
 # ---------------------------
@@ -276,22 +276,14 @@ def generate_context(ai_message: AIMessage, conversation: list, config: dict | N
             )
         )
 
-    try:
-        # Process each tool call, invoke the appropriate tool, and append the result to the conversation
-        # a message with tool calls is expected to be followed by tool responses
-        for tool_call in ai_message.tool_calls:
-            if tool_call["name"] == "SmartphoneInfo":
-                # Pass config with callbacks to ensure tool invocation is traced
-                tool_output = smartphone_info_tool.invoke(tool_call, config=config)
-                conversation.append(tool_output)
-
-    except Exception:
-        logger.exception("An error occurred while processing tool calls")
-        conversation.append(
-            AIMessage(
-                content="An error occurred while processing tool calls."
-            )
-        )
+    # Process each tool call, invoke the appropriate tool, and append the result to the conversation.
+    # Exceptions intentionally propagate to the API boundary so a failed tool call
+    # cannot be converted into input for the final-response LLM.
+    for tool_call in ai_message.tool_calls:
+        if tool_call["name"] == "SmartphoneInfo":
+            # Pass config with callbacks to ensure tool invocation is traced
+            tool_output = smartphone_info_tool.invoke(tool_call, config=config)
+            conversation.append(tool_output)
 
 
 # ---------------------------
@@ -336,6 +328,9 @@ langfuse_handler = CallbackHandler()
 
 @app.post("/ask")
 def ask(request: QueryRequest) -> dict[str, str]:
+    operation = "create_redis_history"
+    session_id_hash = _session_identifier_hash(request.session_id)
+
     try:
         redis_history = create_redis_chat_history(
             session_id=request.session_id,
@@ -343,6 +338,7 @@ def ask(request: QueryRequest) -> dict[str, str]:
             ttl=3600,
         )
 
+        operation = "load_conversation"
         conversation = list(redis_history.messages)
         user_message = HumanMessage(content=request.user_input)
         conversation.append(user_message)
@@ -355,6 +351,7 @@ def ask(request: QueryRequest) -> dict[str, str]:
                 session_id=request.session_id,
                 user_id=request.user_id,
             ):
+                operation = "validate_input"
                 validation_result = input_rails.rails.generate(
                     messages=[
                         {
@@ -392,6 +389,7 @@ def ask(request: QueryRequest) -> dict[str, str]:
 
                     return {"response": rail_response}
 
+                operation = "generate_context"
                 ai_with_tools = context_chain.invoke(
                     {
                         "user_input": request.user_input,
@@ -403,6 +401,7 @@ def ask(request: QueryRequest) -> dict[str, str]:
                     },
                 )
 
+                operation = "execute_tools"
                 generate_context(
                     ai_with_tools,
                     conversation,
@@ -411,6 +410,7 @@ def ask(request: QueryRequest) -> dict[str, str]:
                     },
                 )
 
+                operation = "generate_final_response"
                 response = review_chain.invoke(
                     {
                         "user_id": request.user_id,
@@ -424,17 +424,37 @@ def ask(request: QueryRequest) -> dict[str, str]:
                 )
             span.update(output=response.content)
 
+        operation = "persist_conversation"
         redis_history.add_message(user_message)
         redis_history.add_message(response)
 
         return {"response": response.content}
 
+    except ProductDatabaseUnavailableError as e:
+        logger.error(
+            "Product database unavailable operation=%s exception_type=%s "
+            "collection=%s cleanup_exception_type=%s session_id_hash=%s",
+            e.operation,
+            e.error_type,
+            e.collection_name,
+            e.cleanup_error_type or "none",
+            session_id_hash,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=PRODUCT_DATABASE_UNAVAILABLE_MESSAGE,
+        ) from None
     except Exception as e:
-        logger.exception("Failed to generate a response")
+        logger.error(
+            "Request failed operation=%s exception_type=%s session_id_hash=%s",
+            operation,
+            type(e).__name__,
+            session_id_hash,
+        )
         raise HTTPException(
             status_code=500,
             detail="Failed to generate a response.",
-        ) from e
+        ) from None
 
 
 if __name__ == "__main__":

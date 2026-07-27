@@ -1,4 +1,5 @@
 import os
+import unicodedata
 from collections.abc import Mapping
 from urllib.parse import urlparse
 
@@ -23,15 +24,28 @@ class AppConfig(BaseModel):
         "openai_model",
         "openai_embeddings_model",
         "litellm_api_key",
+        "openai_base_url",
+        "qdrant_url",
         "qdrant_api_key",
+        "redis_url",
+        "langfuse_host",
         "langfuse_public_key",
         "langfuse_secret_key",
+        mode="before",
     )
     @classmethod
-    def validate_required_setting(cls, value: str) -> str:
-        if not value or value == "<>":
+    def normalize_required_setting(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        if any(unicodedata.category(character) == "Cc" for character in value):
+            raise ValueError("must not contain control characters")
+
+        normalized_value = value.strip()
+        if not normalized_value or normalized_value == "<>":
             raise ValueError("must be configured")
-        return value
+
+        return normalized_value
 
     @field_validator("openai_base_url", "qdrant_url", "langfuse_host")
     @classmethod
